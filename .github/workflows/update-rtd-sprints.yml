@@ -9,9 +9,9 @@ jobs:
   update-project-dates:
     runs-on: ubuntu-latest
     env:
-      GITHUB_API: https://api.github.com/graphql
+      GITHUB_API: "https://api.github.com/graphql"
       USER_LOGIN: "QL-Nishtha"
-      PROJECT_NUMBER: 1
+      PROJECT_NUMBER: "1"
     steps:
       - name: Checkout (for auditability)
         uses: actions/checkout@v4
@@ -36,15 +36,13 @@ jobs:
           # Helper to call GraphQL
           graphql() {
             local payload="$1"
-            echo "$(curl -s -H "Authorization: Bearer $PAT" -H "Content-Type: application/json" -X POST -d "$payload" "$GITHUB_API")"
+            curl -s -H "Authorization: Bearer $PAT" -H "Content-Type: application/json" -X POST -d "$payload" "$GITHUB_API"
           }
 
           # 1) Get project info (id, fields, items)
-          read -r project_resp <<EOF
-$(graphql '{"query":"query($login:String!, $num:Int!){ user(login:$login){ projectV2(number:$num){ id title fields(first:100){ nodes{ id name dataType } } items(first:100){ nodes{ id content{ __typename ... on DraftIssue{ title } ... on Issue{ title number url } } } } } } }","variables":{"login":"'"${USER_LOGIN}"'","num":'"${PROJECT_NUMBER}"'}}')
-EOF
+          project_resp="$(graphql '{"query":"query($login:String!, $num:Int!){ user(login:$login){ projectV2(number:$num){ id title fields(first:100){ nodes{ id name dataType } } items(first:100){ nodes{ id content{ __typename ... on DraftIssue{ title } ... on Issue{ title number url } } } } } } }","variables":{"login":"'"${USER_LOGIN}"'","num":'"${PROJECT_NUMBER}"'}}')"
 
-          project_id=$(echo "$project_resp" | jq -r '.data.user.projectV2.id // empty')
+          project_id="$(echo "$project_resp" | jq -r '.data.user.projectV2.id // empty')"
           if [ -z "$project_id" ]; then
             echo "ERROR: Could not find project for user $USER_LOGIN number $PROJECT_NUMBER"
             echo "Response: $project_resp"
@@ -54,24 +52,11 @@ EOF
 
           # Build maps of existing fields and items
           declare -A field_id_by_name
-          echo "$project_resp" | jq -c '.data.user.projectV2.fields.nodes[]' | while read -r fld; do
-            name=$(echo "$fld" | jq -r '.name')
-            id=$(echo "$fld" | jq -r '.id')
-            # shellcheck disable=SC2034
-            printf -v tmp "%s" "$id" # to avoid subshell issues with while
+          while IFS= read -r fld; do
+            name="$(echo "$fld" | jq -r '.name')"
+            id="$(echo "$fld" | jq -r '.id')"
             field_id_by_name["$name"]="$id"
-          done
-
-          # We'll also capture existing items and their titles
-          items_raw=$(echo "$project_resp" | jq -c '.data.user.projectV2.items.nodes[]')
-          declare -A item_id_by_title
-          echo "$project_resp" | jq -c '.data.user.projectV2.items.nodes[]' | while read -r it; do
-            id=$(echo "$it" | jq -r '.id')
-            title=$(echo "$it" | jq -r '.content.__typename as $t | if $t == "DraftIssue" then .content.title elif $t == "Issue" then .content.title else "" end')
-            if [ -n "$title" ] && [ "$title" != "null" ]; then
-              item_id_by_title["$title"]="$id"
-            fi
-          done
+          done < <(echo "$project_resp" | jq -c '.data.user.projectV2.fields.nodes[]')
 
           # Function to create a date field if missing
           ensure_date_field() {
@@ -79,15 +64,12 @@ EOF
             local fid="${field_id_by_name[$fname]:-}"
             if [ -n "$fid" ]; then
               echo "Field '$fname' exists: $fid"
-              echo "$fid"
+              printf '%s' "$fid"
               return
             fi
             echo "Creating date field '$fname'..."
-            # Add field mutation
-            read -r addfld_resp <<EOF
-$(graphql '{"query":"mutation($input:AddProjectV2FieldInput!){ addProjectV2Field(input:$input){ projectV2Field{ id name } }}","variables":{"input":{"projectId":"'"$project_id"'","name":"'"$fname"'","dataType":"DATE"}}}')
-EOF
-            fid=$(echo "$addfld_resp" | jq -r '.data.addProjectV2Field.projectV2Field.id // empty')
+            addfld_resp="$(graphql '{"query":"mutation($input:AddProjectV2FieldInput!){ addProjectV2Field(input:$input){ projectV2Field{ id name } }}","variables":{"input":{"projectId":"'"$project_id"'","name":"'"$fname"'","dataType":"DATE"}}}')"
+            fid="$(echo "$addfld_resp" | jq -r '.data.addProjectV2Field.projectV2Field.id // empty')"
             if [ -z "$fid" ]; then
               echo "ERROR creating field $fname"
               echo "$addfld_resp"
@@ -95,39 +77,32 @@ EOF
             fi
             echo "Created field '$fname' -> $fid"
             field_id_by_name["$fname"]="$fid"
-            echo "$fid"
+            printf '%s' "$fid"
           }
 
           # Ensure "Start date" and "End date" exist
-          start_field_id=$(ensure_date_field "Start date")
-          end_field_id=$(ensure_date_field "End date")
+          start_field_id="$(ensure_date_field "Start date")"
+          end_field_id="$(ensure_date_field "End date")"
 
           # Helper to get or create an item for a sprint label
           get_or_create_item() {
             local label="$1"
-            # Try to find by exact title match among items we fetched
-            # Re-fetch items to be safe
-            read -r items_resp <<EOF
-$(graphql '{"query":"query($login:String!, $num:Int!){ user(login:$login){ projectV2(number:$num){ items(first:100){ nodes{ id content{ __typename ... on DraftIssue{ title } ... on Issue{ title } } } } } } }","variables":{"login":"'"${USER_LOGIN}"'","num":'"${PROJECT_NUMBER}"'}}')
-EOF
-            # Search titles
-            found_id=$(echo "$items_resp" | jq -r --arg label "$label" '.data.user.projectV2.items.nodes[] | . as $n | (.content.__typename as $t | if $t == "DraftIssue" then .content.title elif $t == "Issue" then .content.title else "" end) as $title | select($title==$label) | $n.id' | head -n1 || true)
+            items_resp="$(graphql '{"query":"query($login:String!, $num:Int!){ user(login:$login){ projectV2(number:$num){ items(first:100){ nodes{ id content{ __typename ... on DraftIssue{ title } ... on Issue{ title } } } } } } }","variables":{"login":"'"${USER_LOGIN}"'","num":'"${PROJECT_NUMBER}"'}}')"
+            found_id="$(echo "$items_resp" | jq -r --arg label "$label" '.data.user.projectV2.items.nodes[] | . as $n | (.content.__typename as $t | if $t == "DraftIssue" then .content.title elif $t == "Issue" then .content.title else "" end) as $title | select($title==$label) | $n.id' | head -n1 || true)"
             if [ -n "$found_id" ]; then
-              echo "$found_id"
+              printf '%s' "$found_id"
               return
             fi
             echo "Creating project item with title: $label"
-            read -r add_item_resp <<EOF
-$(graphql '{"query":"mutation($input:AddProjectV2ItemInput!){ addProjectV2Item(input:$input){ item{ id } }}","variables":{"input":{"projectId":"'"$project_id"'","title":"'"$label"'"}}}')
-EOF
-            new_id=$(echo "$add_item_resp" | jq -r '.data.addProjectV2Item.item.id // empty')
+            add_item_resp="$(graphql '{"query":"mutation($input:AddProjectV2ItemInput!){ addProjectV2Item(input:$input){ item{ id } }}","variables":{"input":{"projectId":"'"$project_id"'","title":"'"$label"'"}}}')"
+            new_id="$(echo "$add_item_resp" | jq -r '.data.addProjectV2Item.item.id // empty')"
             if [ -z "$new_id" ]; then
               echo "ERROR creating item $label"
               echo "$add_item_resp"
               exit 1
             fi
             echo "Created item id $new_id for title $label"
-            echo "$new_id"
+            printf '%s' "$new_id"
           }
 
           # Function to set date field on an item
@@ -135,10 +110,8 @@ EOF
             local item_id="$1"
             local field_id="$2"
             local date="$3"
-            read -r upd_resp <<EOF
-$(graphql '{"query":"mutation($input:UpdateProjectV2ItemFieldValueInput!){ updateProjectV2ItemFieldValue(input:$input){ projectV2Item{ id } }}","variables":{"input":{"projectId":"'"$project_id"'","itemId":"'"$item_id"'","fieldId":"'"$field_id"'","value":{"date":"'"$date"'"}}}}')
-EOF
-            ok=$(echo "$upd_resp" | jq -r '.data.updateProjectV2ItemFieldValue.projectV2Item.id // empty')
+            upd_resp="$(graphql '{"query":"mutation($input:UpdateProjectV2ItemFieldValueInput!){ updateProjectV2ItemFieldValue(input:$input){ projectV2Item{ id } }}","variables":{"input":{"projectId":"'"$project_id"'","itemId":"'"$item_id"'","fieldId":"'"$field_id"'","value":{"date":"'"$date"'"}}}}')"
+            ok="$(echo "$upd_resp" | jq -r '.data.updateProjectV2ItemFieldValue.projectV2Item.id // empty')"
             if [ -z "$ok" ]; then
               echo "ERROR setting date $date on item $item_id field $field_id"
               echo "$upd_resp"
@@ -149,12 +122,12 @@ EOF
 
           # Iterate sprints
           echo "$sprints_json" | jq -c '.[]' | while read -r s; do
-            label=$(echo "$s" | jq -r '.label')
-            start=$(echo "$s" | jq -r '.start')
-            end=$(echo "$s" | jq -r '.end')
+            label="$(echo "$s" | jq -r '.label')"
+            start="$(echo "$s" | jq -r '.start')"
+            end="$(echo "$s" | jq -r '.end')"
 
             echo "Processing $label ($start → $end)..."
-            item_id=$(get_or_create_item "$label")
+            item_id="$(get_or_create_item "$label")"
             set_date_field "$item_id" "$start_field_id" "$start"
             set_date_field "$item_id" "$end_field_id" "$end"
           done
